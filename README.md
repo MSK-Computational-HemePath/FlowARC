@@ -33,11 +33,10 @@ The dataset contains raw flow cytometry data files of all normal and abnormal/tu
 * **results_original_test_quantification_module.py** : Evaluate the quantification module (one with the best $R^2$  on the synthetic validation samples) on the original patient test cases. The final output is the corresponding predicted Vs true tumor population plot (Figure 4 in the paper).
 
 ## Folder structure
-* **code** : contains all scripts
-* **model** : contains all trained models
-* **original_data** : contains input raw and annotated flow cytometry files
-* **tmp** : contains the temporary files – the annotated cells with predictions and synthetic samples
+* **code** : for all scripts
+* **model** : for all trained models
+* **original_data** : for input raw and annotated flow cytometry files
+* **tmp** : for the temporary files – the annotated cells with predictions and synthetic samples
 
 ## License
-________________
 This project is under the CC-BY-NC 4.0 license. See LICENSE for details. (c) MSK
