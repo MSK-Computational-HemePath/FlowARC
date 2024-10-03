@@ -1,0 +1,414 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sklearn.utils as sku
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve, RocCurveDisplay, auc
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets
+from torchvision import transforms
+from torch.utils.data.sampler import SubsetRandomSampler
+from torch.utils.data import TensorDataset, DataLoader, Dataset
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+import gc
+import joblib
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+num_epochs = 50
+batch_size = 10
+learning_rate = 5e-2
+
+def calculate_2dft(input):
+    ft = np.fft.ifftshift(input)
+    ft = np.fft.fft2(ft)
+    ft = np.fft.fftshift(ft)
+    return [input,ft.real,ft.imag]
+
+labels_train, fraction_train, accuracy_train = joblib.load('../tmp/Training_input_auto.sav')
+labels_test, fraction_test, accuracy_test = joblib.load('../tmp/Testing_input_auto.sav')
+
+class TorchGenerator(Dataset):
+    # Constructor
+    def __init__(self, hdf_file, label_array):
+        self.y = label_array
+        self.hdf_file = hdf_file
+    def __len__(self):
+        return round(1*len(self.y))
+
+    # Getter
+    def __getitem__(self, idx):
+        tmp_df = pd.read_pickle(self.hdf_file+"df_"+str(idx+1))#
+        tmp_x = tmp_df[:7500].drop(['case','Dx','pred'],axis=1).reset_index(drop=True)
+        tmp_x = calculate_2dft(tmp_x)
+        tmp_mega = tmp_x
+        samplex = torch.tensor(np.float32(tmp_mega))
+        sampley = torch.tensor(np.float32(self.y[idx]))
+        return samplex, sampley
+    
+train_dataset = TorchGenerator( "/global_data/projects/flow/training_input_auto/", labels_train)
+test_dataset = TorchGenerator( "/global_data/projects/flow/testing_input_auto/", labels_test)
+
+
+class block(nn.Module):
+    def __init__(
+        self, in_channels, intermediate_channels, identity_downsample=None, stride=1
+    ):
+        super().__init__()
+        self.expansion = 4
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            intermediate_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(intermediate_channels)
+        self.conv2 = nn.Conv2d(
+            intermediate_channels,
+            intermediate_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(intermediate_channels)
+        self.conv3 = nn.Conv2d(
+            intermediate_channels,
+            intermediate_channels * self.expansion,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(intermediate_channels * self.expansion)
+        self.relu = nn.ReLU()
+        self.identity_downsample = identity_downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x.clone()
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+
+        if self.identity_downsample is not None:
+            identity = self.identity_downsample(identity)
+
+        x += identity
+        x = self.relu(x)
+        return x
+
+
+class ResNet(nn.Module):
+    def __init__(self, block, layers, image_channels, num_classes):
+        super(ResNet, self).__init__()
+        self.in_channels = 64
+        self.conv1 = nn.Conv2d(
+            image_channels, 64, kernel_size=5, stride=2, padding=3, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # Essentially the entire ResNet architecture are in these 4 lines below
+        self.layer1 = self._make_layer(
+            block, layers[0], intermediate_channels=64, stride=1
+        )
+        self.layer2 = self._make_layer(
+            block, layers[1], intermediate_channels=128, stride=2
+        )
+        self.layer3 = self._make_layer(
+            block, layers[2], intermediate_channels=256, stride=2
+        )
+        self.layer4 = self._make_layer(
+            block, layers[3], intermediate_channels=512, stride=2
+        )
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * 4, num_classes)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = x.reshape(x.shape[0], -1)
+        features = x
+        x = self.fc(x)
+
+        return x , features
+
+    def _make_layer(self, block, num_residual_blocks, intermediate_channels, stride):
+        identity_downsample = None
+        layers = []
+
+        # Either if we half the input space for ex, 56x56 -> 28x28 (stride=2), or channels changes
+        # we need to adapt the Identity (skip connection) so it will be able to be added
+        # to the layer that's ahead
+        if stride != 1 or self.in_channels != intermediate_channels * 4:
+            identity_downsample = nn.Sequential(
+                nn.Conv2d(
+                    self.in_channels,
+                    intermediate_channels * 4,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(intermediate_channels * 4),
+            )
+
+        layers.append(
+            block(self.in_channels, intermediate_channels, identity_downsample, stride)
+        )
+
+        # The expansion size is always 4 for ResNet 50,101,152
+        self.in_channels = intermediate_channels * 4
+
+        # For example for first resnet layer: 256 will be mapped to 64 as intermediate layer,
+        # then finally back to 256. Hence no identity downsample is needed, since stride = 1,
+        # and also same amount of channels.
+        for i in range(num_residual_blocks - 1):
+            layers.append(block(self.in_channels, intermediate_channels))
+
+        return nn.Sequential(*layers)
+
+def ResNet101(img_channel=3, num_classes=1000):
+    return ResNet(block, [3, 4, 23, 3], img_channel, num_classes)
+
+class OrthogonalProjectionLoss(nn.Module):
+    def __init__(self, gamma=0.5):
+        super(OrthogonalProjectionLoss, self).__init__()
+        self.gamma = gamma
+
+    def forward(self, features, labels=None):
+        #  features are normalized
+        features = F.normalize(features, p=2, dim=1)
+
+        labels = labels[:, None]  # extend dim
+
+        mask = torch.eq(labels, labels.t()).bool().to(device)
+        eye = torch.eye(mask.shape[0], mask.shape[1]).bool().to(device)
+
+        mask_pos = mask.masked_fill(eye, 0).float()
+        mask_neg = (~mask).float()
+        dot_prod = torch.matmul(features, features.t())
+
+        pos_pairs_mean = (mask_pos * dot_prod).sum() / (mask_pos.sum() + 1e-6)
+        neg_pairs_mean = (mask_neg * dot_prod).sum() / (mask_neg.sum() + 1e-6)  # TODO: removed abs
+
+        loss = (1.0 - pos_pairs_mean) + self.gamma * neg_pairs_mean
+
+        return loss
+
+def train(model, device, train_loader, optimizer, epoch):
+    # Set the model to training mode
+    model.train()
+    train_loss = 0
+    for batch_idx, (data, target) in enumerate(train_loader):
+        target = target.type(torch.LongTensor)
+        data, target = data.to(device), target.to(device)
+        
+        # Reset the optimizer
+        optimizer.zero_grad()
+        
+        # Push the data forward through the model layers
+        output = model(data)
+        
+        # Get the loss
+        loss = loss_criteria(output[0], target) + op_loss(output[1], target)
+        
+        # Keep a running total
+        train_loss += loss.item()
+        
+        # Backpropagate
+        loss.backward()
+        optimizer.step()
+        
+    avg_loss = train_loss / (batch_idx+1)
+    
+    scheduler.step()
+    
+    return avg_loss
+            
+    
+    
+def compute_metrics(model, test_loader, plot_roc_curve = False):
+    
+    model.eval()
+    
+    val_loss = 0
+    val_correct = 0    
+    score_list   = torch.Tensor([]).to(device)
+    pred_list    = torch.Tensor([]).to(device).long()
+    target_list  = torch.Tensor([]).to(device).long()
+
+    
+    for iter_num, (image, target) in enumerate(test_loader):
+        
+        target = target.type(torch.LongTensor)
+        image, target = image.to(device), target.to(device)
+        
+        # Compute the loss
+        with torch.no_grad():
+            output = model(image)
+        
+        # Log loss
+        val_loss += loss_criteria(output[0], target.long()).item() + op_loss(output[1], target.long()).item()
+
+        
+        # Calculate the number of correctly classified examples
+        pred = output[0].argmax(dim=1, keepdim=True)
+        val_correct += pred.eq(target.long().view_as(pred)).sum().item()
+        
+        # Bookkeeping 
+        score_list   = torch.cat([score_list, nn.Softmax(dim = 1)(output[0])[:,1].squeeze()])
+        pred_list    = torch.cat([pred_list, pred.squeeze()])
+        target_list  = torch.cat([target_list, target.squeeze()])
+        
+    
+    classification_metrics = classification_report(target_list.tolist(), pred_list.tolist(),
+                                                  target_names = ['Negative Sample', 'Positive Sample'],
+                                                  output_dict= True)
+    
+    # sensitivity is the recall of the positive class
+    sensitivity = classification_metrics['Positive Sample']['recall']
+    
+    # specificity is the recall of the negative class 
+    specificity = classification_metrics['Negative Sample']['recall']
+    
+    # accuracy
+    accuracy = classification_metrics['accuracy']
+    
+    # confusion matrix
+    conf_matrix = confusion_matrix(target_list.tolist(), pred_list.tolist())
+    
+    # roc score
+    roc_score = roc_auc_score(target_list.tolist(), score_list.tolist())
+    
+    # plot the roc curve
+    if plot_roc_curve:
+        fpr, tpr, _ = roc_curve(target_list.tolist(), score_list.tolist())
+        plt.plot(fpr, tpr, label = "Area under ROC = {:.4f}".format(roc_score))
+        plt.legend(loc = 'best')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.show()
+
+    # put together values
+    metrics_dict = {"Accuracy": accuracy,
+                    "Sensitivity": sensitivity,
+                    "Specificity": specificity,
+                    "Roc_score"  : roc_score, 
+                    "Confusion Matrix": conf_matrix,
+                    "Validation Loss": val_loss / len(test_loader),
+                    "score_list":  score_list.tolist(),
+                    "pred_list": pred_list.tolist(),
+                    "target_list": target_list.tolist()}
+    return metrics_dict
+
+prediction_probability_array=[]
+label_array=[]
+for iteration in range(5):
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8,pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,num_workers=8,pin_memory=True)
+    
+    model = ResNet101(img_channel=3, num_classes=2)
+    model.to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum = 0.9)
+    loss_criteria = nn.CrossEntropyLoss()
+    op_loss = OrthogonalProjectionLoss(gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[5,10,15,20,30], gamma=0.1)
+    
+    epoch_nums = []
+    epochs = num_epochs
+    for epoch in range(1, epochs + 1):
+        train_loss = train(model, device, train_loader, optimizer, epoch)
+    metrics_dict2 = compute_metrics(model, test_loader, plot_roc_curve = False)
+    prediction_probability_array.append(metrics_dict2["score_list"])
+    label_array.append(metrics_dict2["target_list"])
+    torch.save(model.state_dict(), '../model/sample_level_module_auto_bootstrap_'+str(iteration+1))
+    print('Completed Model '+str(iteration+1))
+
+auc_values=[]
+for iteration in range(5):
+    roc_auc = roc_auc_score(label_array[iteration], prediction_probability_array[iteration])
+    auc_values.append(roc_auc)
+
+fig = plt.figure(figsize=(6, 4),facecolor='white')
+ax = fig.add_subplot(111)
+
+tprs = []
+aucs = []
+mean_fpr = np.linspace(0, 1, 600)
+
+#fig, ax = plt.subplots(figsize=(6, 6))
+for fold in range(5):
+    viz = RocCurveDisplay.from_predictions(
+        y_true=label_array[fold],
+        y_pred=prediction_probability_array[fold],
+        name='_nolegend_',
+        #name=f"ROC fold {fold}",
+        alpha=0.3,
+        lw=1,
+        ax=ax,
+        #plot_chance_level=(fold == 6 - 1),
+    )
+    interp_tpr = np.interp(mean_fpr, viz.fpr, viz.tpr)
+    interp_tpr[0] = 0.0
+    tprs.append(interp_tpr)
+    aucs.append(viz.roc_auc)
+
+mean_tpr = np.mean(tprs, axis=0)
+mean_tpr[-1] = 1.0
+mean_auc = auc(mean_fpr, mean_tpr)
+std_auc = 2*np.std(aucs)
+ax.plot(
+    mean_fpr,
+    mean_tpr,
+    color="b",
+    label=r"Mean ROC (AUC = %0.3f $\pm$ %0.3f)" % (mean_auc, std_auc),
+    lw=1.2,
+    alpha=0.8,
+)
+
+std_tpr = 2*np.std(tprs, axis=0)
+tprs_upper = np.minimum(mean_tpr + std_tpr, 1)
+tprs_lower = np.maximum(mean_tpr - std_tpr, 0)
+ax.fill_between(
+    mean_fpr,
+    tprs_lower,
+    tprs_upper,
+    color="grey",
+    alpha=0.2,
+    label=r"$\pm$ 95% CI",
+)
+
+ax.set(
+    xlabel="False Positive Rate",
+    ylabel="True Positive Rate",
+    #title=f"Mean ROC curve"
+)
+ax.legend(loc="lower right")
+ax.xaxis.label.set_size(14)
+ax.yaxis.label.set_size(14)
+plt.xticks(fontsize=11)
+plt.yticks(fontsize=11)
+plt.tight_layout()
+plt.savefig('AUC_big.png', dpi=500);
